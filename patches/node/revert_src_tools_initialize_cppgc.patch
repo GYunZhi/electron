@@ -1,0 +1,300 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Shelley Vohr <shelley.vohr@gmail.com>
+Date: Thu, 23 Nov 2023 09:58:34 +0100
+Subject: revert: src,tools initialize cppgc
+
+This reverts commit 099159ce042cae3022d9050121752336df20b740.
+
+This commit currently causes crashes on 32-bit architectures. See
+https://gist.github.com/codebytere/275ec8923253fd6559b3d36115f7b31b for
+more details about the crash.
+
+This should be reverted until the issue is resolved.
+
+diff --git a/src/env-inl.h b/src/env-inl.h
+index e248a144b905a6c7c166796cddfe8442f8dc7158..e8cd94750a6b0c2dce50298f255fcbbf84a38861 100644
+--- a/src/env-inl.h
++++ b/src/env-inl.h
+@@ -34,7 +34,6 @@
+ #include "node_realm-inl.h"
+ #include "util-inl.h"
+ #include "uv.h"
+-#include "v8-cppgc.h"
+ #include "v8.h"
+ 
+ #include <cstddef>
+@@ -62,31 +61,6 @@ inline uv_loop_t* IsolateData::event_loop() const {
+   return event_loop_;
+ }
+ 
+-inline void IsolateData::SetCppgcReference(v8::Isolate* isolate,
+-                                           v8::Local<v8::Object> object,
+-                                           void* wrappable) {
+-  v8::CppHeap* heap = isolate->GetCppHeap();
+-  CHECK_NOT_NULL(heap);
+-  v8::WrapperDescriptor descriptor = heap->wrapper_descriptor();
+-  uint16_t required_size = std::max(descriptor.wrappable_instance_index,
+-                                    descriptor.wrappable_type_index);
+-  CHECK_GT(object->InternalFieldCount(), required_size);
+-
+-  uint16_t* id_ptr = nullptr;
+-  {
+-    Mutex::ScopedLock lock(isolate_data_mutex_);
+-    auto it =
+-        wrapper_data_map_.find(descriptor.embedder_id_for_garbage_collected);
+-    CHECK_NE(it, wrapper_data_map_.end());
+-    id_ptr = &(it->second->cppgc_id);
+-  }
+-
+-  object->SetAlignedPointerInInternalField(descriptor.wrappable_type_index,
+-                                           id_ptr);
+-  object->SetAlignedPointerInInternalField(descriptor.wrappable_instance_index,
+-                                           wrappable);
+-}
+-
+ inline uint16_t* IsolateData::embedder_id_for_cppgc() const {
+   return &(wrapper_data_->cppgc_id);
+ }
+diff --git a/src/env.cc b/src/env.cc
+index 1d8df40c3446ac9c72c5f0ad24edf0b8a96cf16b..be0f638b53552ab4b7cec3138478cbb6855b62fb 100644
+--- a/src/env.cc
++++ b/src/env.cc
+@@ -38,8 +38,6 @@ using errors::TryCatchScope;
+ using v8::Array;
+ using v8::Boolean;
+ using v8::Context;
+-using v8::CppHeap;
+-using v8::CppHeapCreateParams;
+ using v8::EmbedderGraph;
+ using v8::EscapableHandleScope;
+ using v8::Function;
+@@ -64,7 +62,6 @@ using v8::TracingController;
+ using v8::TryCatch;
+ using v8::Undefined;
+ using v8::Value;
+-using v8::WrapperDescriptor;
+ using worker::Worker;
+ 
+ int const ContextEmbedderTag::kNodeContextTag = 0x6e6f64;
+@@ -542,14 +539,6 @@ IsolateData::IsolateData(Isolate* isolate,
+     // for embedder ID, V8 could accidentally enable cppgc on them. So
+     // safe guard against this.
+     DCHECK_NE(descriptor.wrappable_type_index, BaseObject::kSlot);
+-  } else {
+-    cpp_heap_ = CppHeap::Create(
+-        platform,
+-        CppHeapCreateParams{
+-            {},
+-            WrapperDescriptor(
+-                BaseObject::kEmbedderType, BaseObject::kSlot, cppgc_id)});
+-    isolate->AttachCppHeap(cpp_heap_.get());
+   }
+   // We do not care about overflow since we just want this to be different
+   // from the cppgc id.
+@@ -577,21 +566,6 @@ IsolateData::IsolateData(Isolate* isolate,
+   }
+ }
+ 
+-IsolateData::~IsolateData() {
+-  if (cpp_heap_ != nullptr) {
+-    // The CppHeap must be detached before being terminated.
+-    isolate_->DetachCppHeap();
+-    cpp_heap_->Terminate();
+-  }
+-}
+-
+-// Public API
+-void SetCppgcReference(Isolate* isolate,
+-                       Local<Object> object,
+-                       void* wrappable) {
+-  IsolateData::SetCppgcReference(isolate, object, wrappable);
+-}
+-
+ void IsolateData::MemoryInfo(MemoryTracker* tracker) const {
+ #define V(PropertyName, StringValue)                                           \
+   tracker->TrackField(#PropertyName, PropertyName());
+diff --git a/src/env.h b/src/env.h
+index c9a455be8c395a2f231f56e0a54211466362aa1d..a8553cad68cac33d4aba83d938f6f5e100aaaca1 100644
+--- a/src/env.h
++++ b/src/env.h
+@@ -62,10 +62,6 @@
+ #include <unordered_set>
+ #include <vector>
+ 
+-namespace v8 {
+-class CppHeap;
+-}
+-
+ namespace node {
+ 
+ namespace shadow_realm {
+@@ -140,7 +136,6 @@ class NODE_EXTERN_PRIVATE IsolateData : public MemoryRetainer {
+               MultiIsolatePlatform* platform = nullptr,
+               ArrayBufferAllocator* node_allocator = nullptr,
+               const SnapshotData* snapshot_data = nullptr);
+-  ~IsolateData();
+ 
+   SET_MEMORY_INFO_NAME(IsolateData)
+   SET_SELF_SIZE(IsolateData)
+@@ -153,10 +148,6 @@ class NODE_EXTERN_PRIVATE IsolateData : public MemoryRetainer {
+   uint16_t* embedder_id_for_cppgc() const;
+   uint16_t* embedder_id_for_non_cppgc() const;
+ 
+-  static inline void SetCppgcReference(v8::Isolate* isolate,
+-                                       v8::Local<v8::Object> object,
+-                                       void* wrappable);
+-
+   inline uv_loop_t* event_loop() const;
+   inline MultiIsolatePlatform* platform() const;
+   inline const SnapshotData* snapshot_data() const;
+@@ -238,7 +229,6 @@ class NODE_EXTERN_PRIVATE IsolateData : public MemoryRetainer {
+   NodeArrayBufferAllocator* const node_allocator_;
+   MultiIsolatePlatform* platform_;
+   const SnapshotData* snapshot_data_;
+-  std::unique_ptr<v8::CppHeap> cpp_heap_;
+   std::shared_ptr<PerIsolateOptions> options_;
+   worker::Worker* worker_context_ = nullptr;
+   bool is_building_snapshot_ = false;
+diff --git a/src/node.cc b/src/node.cc
+index e58f28e0f0ff8d61f35ec3c5a69aa37c66c25d78..c0cb524e77f816368bda1abaa84264edc02ce4d5 100644
+--- a/src/node.cc
++++ b/src/node.cc
+@@ -63,8 +63,6 @@
+ #endif  // NODE_USE_V8_PLATFORM
+ #include "v8-profiler.h"
+ 
+-#include "cppgc/platform.h"
+-
+ #if HAVE_INSPECTOR
+ #include "inspector/worker_inspector.h"  // ParentInspectorHandle
+ #endif
+@@ -1132,14 +1130,6 @@ InitializeOncePerProcessInternal(const std::vector<std::string>& args,
+     V8::Initialize();
+   }
+ 
+-  if (!(flags & ProcessInitializationFlags::kNoInitializeCppgc)) {
+-    v8::PageAllocator* allocator = nullptr;
+-    if (result->platform_ != nullptr) {
+-      allocator = result->platform_->GetPageAllocator();
+-    }
+-    cppgc::InitializeProcess(allocator);
+-  }
+-
+   performance::performance_v8_start = PERFORMANCE_NOW();
+   per_process::v8_initialized = true;
+ 
+@@ -1159,10 +1149,6 @@ void TearDownOncePerProcess() {
+     ResetSignalHandlers();
+   }
+ 
+-  if (!(flags & ProcessInitializationFlags::kNoInitializeCppgc)) {
+-    cppgc::ShutdownProcess();
+-  }
+-
+   per_process::v8_initialized = false;
+   if (!(flags & ProcessInitializationFlags::kNoInitializeV8)) {
+     V8::Dispose();
+diff --git a/src/node.h b/src/node.h
+index 3ffc51783b0b6dee1c0f0a37d2f52cb1aec2fa3f..7c5be5bbc4ecfdd278bd07246a0f232cf0d63866 100644
+--- a/src/node.h
++++ b/src/node.h
+@@ -284,7 +284,7 @@ enum Flags : uint32_t {
+       kNoStdioInitialization | kNoDefaultSignalHandling | kNoInitializeV8 |
+       kNoInitializeNodeV8Platform | kNoInitOpenSSL |
+       kNoParseGlobalDebugVariables | kNoAdjustResourceLimits |
+-      kNoUseLargePages | kNoPrintHelpOrVersionOutput | kNoInitializeCppgc,
++      kNoUseLargePages | kNoPrintHelpOrVersionOutput,
+ };
+ }  // namespace ProcessInitializationFlags
+ namespace ProcessFlags = ProcessInitializationFlags;  // Legacy alias.
+@@ -1507,25 +1507,6 @@ void RegisterSignalHandler(int signal,
+                            bool reset_handler = false);
+ #endif  // _WIN32
+ 
+-// Configure the layout of the JavaScript object with a cppgc::GarbageCollected
+-// instance so that when the JavaScript object is reachable, the garbage
+-// collected instance would have its Trace() method invoked per the cppgc
+-// contract. To make it work, the process must have called
+-// cppgc::InitializeProcess() before, which is usually the case for addons
+-// loaded by the stand-alone Node.js executable. Embedders of Node.js can use
+-// either need to call it themselves or make sure that
+-// ProcessInitializationFlags::kNoInitializeCppgc is *not* set for cppgc to
+-// work.
+-// If the CppHeap is owned by Node.js, which is usually the case for addon,
+-// the object must be created with at least two internal fields available,
+-// and the first two internal fields would be configured by Node.js.
+-// This may be superseded by a V8 API in the future, see
+-// https://bugs.chromium.org/p/v8/issues/detail?id=13960. Until then this
+-// serves as a helper for Node.js isolates.
+-NODE_EXTERN void SetCppgcReference(v8::Isolate* isolate,
+-                                   v8::Local<v8::Object> object,
+-                                   void* wrappable);
+-
+ }  // namespace node
+ 
+ #endif  // SRC_NODE_H_
+diff --git a/src/node_main_instance.cc b/src/node_main_instance.cc
+index e1e456cfad932548442e7ded9782042340825332..2ef56f80dfc8f6b07b50eed28e6cc761f2a833a2 100644
+--- a/src/node_main_instance.cc
++++ b/src/node_main_instance.cc
+@@ -68,8 +68,6 @@ NodeMainInstance::~NodeMainInstance() {
+     return;
+   }
+   // This should only be done on a main instance that owns its isolate.
+-  // IsolateData must be freed before UnregisterIsolate() is called.
+-  isolate_data_.reset();
+   platform_->UnregisterIsolate(isolate_);
+   isolate_->Dispose();
+ }
+diff --git a/src/node_worker.cc b/src/node_worker.cc
+index 900674bbe4c90e9aeb2013c06c9979864b06dcd5..478e80be505bca801574b780e19eff5a59eb07de 100644
+--- a/src/node_worker.cc
++++ b/src/node_worker.cc
+@@ -11,7 +11,6 @@
+ #include "node_snapshot_builder.h"
+ #include "permission/permission.h"
+ #include "util-inl.h"
+-#include "v8-cppgc.h"
+ 
+ #include <memory>
+ #include <string>
+diff --git a/tools/install.py b/tools/install.py
+index 74b01f8352021f1105c080dbbf8bb29121a13501..28c315325fb3aa1aa7599c2919fdd043e9f4eb47 100755
+--- a/tools/install.py
++++ b/tools/install.py
+@@ -213,35 +213,6 @@ def headers(action):
+       '../../v8/include/cppgc/internal/persistent-node.h',
+       '../../v8/include/cppgc/internal/pointer-policies.h',
+       '../../v8/include/cppgc/internal/write-barrier.h',
+-      # cppgc headers
+-      '../../v8/include/cppgc/allocation.h',
+-      '../../v8/include/cppgc/common.h',
+-      '../../v8/include/cppgc/cross-thread-persistent.h',
+-      '../../v8/include/cppgc/custom-space.h',
+-      '../../v8/include/cppgc/default-platform.h',
+-      '../../v8/include/cppgc/ephemeron-pair.h',
+-      '../../v8/include/cppgc/explicit-management.h',
+-      '../../v8/include/cppgc/garbage-collected.h',
+-      '../../v8/include/cppgc/heap-consistency.h',
+-      '../../v8/include/cppgc/heap-handle.h',
+-      '../../v8/include/cppgc/heap-state.h',
+-      '../../v8/include/cppgc/heap-statistics.h',
+-      '../../v8/include/cppgc/heap.h',
+-      '../../v8/include/cppgc/liveness-broker.h',
+-      '../../v8/include/cppgc/macros.h',
+-      '../../v8/include/cppgc/member.h',
+-      '../../v8/include/cppgc/name-provider.h',
+-      '../../v8/include/cppgc/object-size-trait.h',
+-      '../../v8/include/cppgc/persistent.h',
+-      '../../v8/include/cppgc/platform.h',
+-      '../../v8/include/cppgc/prefinalizer.h',
+-      '../../v8/include/cppgc/process-heap-statistics.h',
+-      '../../v8/include/cppgc/sentinel-pointer.h',
+-      '../../v8/include/cppgc/source-location.h',
+-      '../../v8/include/cppgc/testing.h',
+-      '../../v8/include/cppgc/trace-trait.h',
+-      '../../v8/include/cppgc/type-traits.h',
+-      '../../v8/include/cppgc/visitor.h',
+       # libplatform headers
+       '../../v8/include/libplatform/libplatform-export.h',
+       '../../v8/include/libplatform/libplatform.h',
